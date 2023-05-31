@@ -16,6 +16,11 @@ class PitchMask(nn.Module):
         depthwise=True,
         n_layers=8,
         vocex=None,
+        downsample_factor=2,
+        do_bucketize=True,
+        pitch_buckets=1024,
+        energy_buckets=1024,
+        use_energy=True,
     ):
         super().__init__()
         in_channels = in_channels
@@ -25,7 +30,11 @@ class PitchMask(nn.Module):
         depthwise = depthwise
         num_outputs = out_channels
         
-        self.in_layer = nn.Linear(in_channels, filter_size)
+        if not do_bucketize:
+            if not use_energy:
+                self.in_layer = nn.Linear(in_channels, filter_size)
+            else:
+                self.in_layer = nn.Linear(in_channels+1, filter_size)
 
         self.positional_encoding = PositionalEncoding(filter_size)
 
@@ -43,6 +52,13 @@ class PitchMask(nn.Module):
             num_layers=n_layers,
         )
 
+        if do_bucketize:
+            num_outputs = pitch_buckets
+            if use_energy:
+                num_outputs = pitch_buckets + energy_buckets
+        elif use_energy:
+            num_outputs = 2
+
         self.linear = nn.Sequential(
             nn.Linear(filter_size, 1024),
             nn.ReLU(),
@@ -55,6 +71,18 @@ class PitchMask(nn.Module):
 
         self.vocex = vocex
 
+        self.downsample_factor = downsample_factor
+
+        if do_bucketize:
+            self.pitch_embedding = nn.Embedding(pitch_buckets, filter_size)
+            self.pitch_bins = torch.linspace(-2.5, 2.5, pitch_buckets)
+            if use_energy:
+                self.energy_embedding = nn.Embedding(energy_buckets, filter_size)
+                self.energy_bins = torch.linspace(-2.5, 2.5, energy_buckets)
+
+        self.use_energy = use_energy
+        self.do_bucketize = do_bucketize
+
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             module.weight.data.normal_(mean=0.0, std=0.02)
@@ -64,27 +92,86 @@ class PitchMask(nn.Module):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
 
-    def forward(self, mel, mask, padding_mask):
+    def forward(self, mel, mask, padding_mask, return_embedding=False):
         with torch.no_grad():
-            pitch = self.vocex(mel, inference=True)["measures"]["pitch"].unsqueeze(-1)
+            measures = self.vocex(mel, inference=True)["measures"]
             # normalize pitch
+            pitch = measures["pitch"].unsqueeze(-1)
             pitch = (pitch - pitch.mean()) / pitch.std()
             mask = mask.unsqueeze(-1)
             masked_pitch = pitch * (1-mask)
+            if self.downsample_factor > 1:
+                masked_pitch = masked_pitch[:, ::self.downsample_factor]
+                mask = mask[:, ::self.downsample_factor]
+                padding_mask = padding_mask[:, ::self.downsample_factor]
+                pitch = pitch[:, ::self.downsample_factor]
+            if self.use_energy:
+                energy = measures["energy"].unsqueeze(-1)
+                energy = (energy - energy.mean()) / energy.std()
+                if self.downsample_factor > 1:
+                    energy = energy[:, ::self.downsample_factor]
+                masked_energy = energy * (1-mask)
              
-        x = self.in_layer(masked_pitch)
+        if self.do_bucketize:
+            masked_pitch = masked_pitch.squeeze(-1)
+            pitch = pitch.squeeze(-1)
+            masked_pitch = torch.bucketize(masked_pitch, self.pitch_bins)
+            pitch = torch.bucketize(pitch, self.pitch_bins)
+            masked_pitch = self.pitch_embedding(masked_pitch)
+            mask = mask.squeeze(-1)
+            padding_mask = padding_mask.squeeze(-1)
+            if self.use_energy:
+                masked_energy = masked_energy.squeeze(-1)
+                energy = energy.squeeze(-1)
+                energy = torch.bucketize(energy, self.energy_bins)
+                masked_energy = torch.bucketize(masked_energy, self.energy_bins)
+                masked_energy = self.energy_embedding(masked_energy)
+                x = masked_pitch + masked_energy
+        else:
+            x = self.in_layer(masked_pitch)
+
+        if return_embedding:
+            result_dict = {
+                "embedding": x,
+            }
+        else:
+            result_dict = {}
+        
         x = self.positional_encoding(x)
         x = self.layers(x, src_key_padding_mask=padding_mask)
         x = self.linear(x)
 
-        padding_mask = padding_mask.unsqueeze(-1)
-
-        loss = nn.functional.mse_loss(x*mask*padding_mask, pitch*mask*padding_mask)
-
-        reconstructed_pitch = x * mask + masked_pitch
-
-        return {
-            "loss": loss,
-            "pitch": reconstructed_pitch,
-            "real_pitch": pitch,
-        }
+        if self.do_bucketize:
+            num_pitch_bins = self.pitch_embedding.num_embeddings
+            pitch_loss = nn.functional.cross_entropy(x.transpose(1, 2)[:, :num_pitch_bins], pitch, reduction="none")
+            pitch_loss = (pitch_loss * mask * padding_mask)
+            if self.use_energy:
+                num_energy_bins = self.energy_embedding.num_embeddings
+                energy_loss = nn.functional.cross_entropy(x.transpose(1, 2)[:, num_energy_bins:], energy, reduction="none")
+                energy_loss = (energy_loss * mask * padding_mask)
+                loss = 0.5 * pitch_loss + 0.5 * energy_loss
+            else:
+                loss = pitch_loss
+            loss = loss.sum() / (mask * padding_mask).sum()
+            reconstructed_pitch = self.pitch_bins.to(x.device)[x.argmax(-1)]
+            real_pitch = self.pitch_bins.to(x.device)[pitch]
+            result_dict.update({
+                "loss": loss,
+                "pitch": reconstructed_pitch,
+                "real_pitch": real_pitch,
+                "padding_mask": padding_mask,
+                "mask": mask,
+            })
+            return result_dict
+        else:
+            padding_mask = padding_mask.unsqueeze(-1)
+            loss = nn.functional.mse_loss(x*mask*padding_mask, pitch*mask*padding_mask)
+            reconstructed_pitch = x * mask + masked_pitch
+            result_dict.update({
+                "loss": loss,
+                "pitch": reconstructed_pitch,
+                "real_pitch": pitch,
+                "padding_mask": padding_mask,
+                "mask": mask,
+            })
+            return result_dict

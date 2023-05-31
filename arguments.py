@@ -3,7 +3,7 @@ from dataclasses import dataclass
 @dataclass
 class Args:
     # vocex
-    vocex_url: str = "https://github.com/MiniXC/vocex/raw/main/models/vocex_libritts_softdtw_19k.pt"
+    vocex_url: str = "https://github.com/MiniXC/vocex/raw/main/models/vocex_600k.pt"
     vocex_path: str = "vocex"
     # data loading
     dataset: str = "cdminix/libritts-aligned"
@@ -17,6 +17,11 @@ class Args:
     filter_size: int = 256
     kernel_size: int = 3
     dropout: float = 0.1
+    downsample_factor: int = 4
+    do_bucketize: bool = True
+    pitch_buckets: int = 128
+    energy_buckets: int = 128
+    use_energy: bool = False
     # training
     max_epochs: int = 20
     learning_rate: float = 1e-4

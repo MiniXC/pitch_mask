@@ -21,7 +21,7 @@ import torchaudio.transforms as AT
 from librosa.filters import mel as librosa_mel
 import librosa
 
-from vocex import Vocex
+from vocex import VocexModel
 from arguments import Args
 from pitch_mask.model import PitchMask
 
@@ -36,8 +36,8 @@ def eval_loop(accelerator, model, eval_ds, step):
             if i == 0:
                 reconstructed_pitch = outputs["pitch"].cpu().numpy()
                 pitch = outputs["real_pitch"].cpu().numpy()
-                mask = batch["mask"].cpu().numpy()
-                padding_mask = batch["padding_mask"].cpu().numpy()
+                mask = outputs["mask"].cpu().numpy()
+                padding_mask = outputs["padding_mask"].cpu().numpy()
                 # plot the first batch
                 fig, ax = plt.subplots(pitch.shape[0], 1, figsize=(10, 10))
                 for j in range(pitch.shape[0]):
@@ -47,6 +47,7 @@ def eval_loop(accelerator, model, eval_ds, step):
                     reconstructed_pitch[j][padding_mask[j] == 0] = np.nan
                     ax[j].plot(reconstructed_pitch[j])
                 wandb.log({"pitch": wandb.Image(fig)})
+                plt.savefig(f"pitch_{step}.png")
             loss += outputs["loss"].item()
             i += 1
             progress_bar.update(1)
@@ -175,15 +176,17 @@ def main():
         max_frames=args.max_frames,
     )
 
-    vocex_model = Vocex(measures="energy,pitch,srmr,snr,voice_activity_binary".split(","))
+    vocex_model = VocexModel(measures="energy,pitch,srmr,snr,voice_activity_binary".split(","))
     vocex_url = args.vocex_url
+    filename = vocex_url.split("/")[-1]
     # download model
-    if not os.path.exists(args.vocex_path):
+    if not os.path.exists(args.vocex_path + "/" + filename):
         print("Downloading vocex model")
-        os.makedirs(args.vocex_path)
+        if not os.path.exists(args.vocex_path):
+            os.makedirs(args.vocex_path)
         r = requests.get(vocex_url, allow_redirects=True)
-        open(os.path.join(args.vocex_path, "vocex.pt"), "wb").write(r.content)
-    vocex_model.load_state_dict(torch.load(os.path.join(args.vocex_path, "vocex.pt")))
+        open(os.path.join(args.vocex_path, filename), "wb").write(r.content)
+    vocex_model.load_state_dict(torch.load(os.path.join(args.vocex_path, filename)))
     for scaler_key in vocex_model.scalers.keys():
         vocex_model.scalers[scaler_key].is_fit = True
 
@@ -195,6 +198,7 @@ def main():
         n_layers=args.n_layers,
         dropout=args.dropout,
         vocex=vocex_model,
+        downsample_factor=args.downsample_factor,
     )
 
 
@@ -218,6 +222,8 @@ def main():
                     in zip(current_model_dict.keys(), loaded_state_dict.values())
                 }
                 model.load_state_dict(new_state_dict, strict=False)
+        for scaler_key in model.vocex.scalers.keys():
+            model.vocex.scalers[scaler_key].is_fit = True
 
     train_dataloader = torch.utils.data.DataLoader(
         train_ds,
