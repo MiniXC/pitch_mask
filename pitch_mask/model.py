@@ -126,7 +126,9 @@ class PitchMask(nn.Module):
                 energy = torch.bucketize(energy, self.energy_bins)
                 masked_energy = torch.bucketize(masked_energy, self.energy_bins)
                 masked_energy = self.energy_embedding(masked_energy)
-                x = masked_pitch + masked_energy
+                x = 0.5 * masked_pitch + 0.5 * masked_energy
+            else:
+                x = masked_pitch
         else:
             x = self.in_layer(masked_pitch)
 

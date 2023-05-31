@@ -7,8 +7,8 @@ class Args:
     vocex_path: str = "vocex"
     # data loading
     dataset: str = "cdminix/libritts-aligned"
-    train_split: str = "train"
-    eval_split: str = "dev"
+    train_split: str = "train.all"
+    eval_split: str = "dev.all"
     num_workers: int = 96
     prefetch_factor: int = 2
     # model

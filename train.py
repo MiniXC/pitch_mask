@@ -20,6 +20,7 @@ import torchaudio
 import torchaudio.transforms as AT
 from librosa.filters import mel as librosa_mel
 import librosa
+from sklearn.decomposition import PCA
 
 from vocex import VocexModel
 from arguments import Args
@@ -30,9 +31,12 @@ def eval_loop(accelerator, model, eval_ds, step):
     loss = 0.0
     i = 0
     progress_bar = tqdm(range(len(eval_ds)), desc="eval")
+    dvectors = []
+    speakers = []
+    embeddings = []
     for batch in eval_ds:
         with torch.no_grad():
-            outputs = model(**batch)
+            outputs = model(mel=batch["mel"], mask=batch["mask"], padding_mask=batch["padding_mask"], return_embedding=True)
             if i == 0:
                 reconstructed_pitch = outputs["pitch"].cpu().numpy()
                 pitch = outputs["real_pitch"].cpu().numpy()
@@ -47,10 +51,103 @@ def eval_loop(accelerator, model, eval_ds, step):
                     reconstructed_pitch[j][padding_mask[j] == 0] = np.nan
                     ax[j].plot(reconstructed_pitch[j])
                 wandb.log({"pitch": wandb.Image(fig)})
-                plt.savefig(f"pitch_{step}.png")
             loss += outputs["loss"].item()
             i += 1
+            dvector = model.vocex(batch["mel"], inference=True)["dvector"]
+            dvectors += list(dvector.cpu().numpy())
+            speakers += batch["speaker"]
+            mean_embedding_per_sample = outputs["embedding"].mean(dim=1).cpu().numpy()
+            embeddings += list(mean_embedding_per_sample)
             progress_bar.update(1)
+    # visualize dvectors using PCA
+    dvectors = np.array(dvectors)
+    dvectors = (dvectors - dvectors.mean()) / dvectors.std()
+    pca = PCA(n_components=2)
+    dvectors_pca = pca.fit_transform(dvectors)
+    fig, ax = plt.subplots(figsize=(10, 10))
+    sns.scatterplot(x=dvectors_pca[:, 0], y=dvectors_pca[:, 1], hue=speakers, ax=ax)
+    wandb.log({"dvectors": wandb.Image(fig)})
+    # visualize embeddings using PCA
+    embeddings = np.array(embeddings)
+    embeddings = (embeddings - embeddings.mean()) / embeddings.std()
+    pca = PCA(n_components=2)
+    embeddings_pca = pca.fit_transform(embeddings)
+    fig, ax = plt.subplots(figsize=(10, 10))
+    sns.scatterplot(x=embeddings_pca[:, 0], y=embeddings_pca[:, 1], hue=speakers, ax=ax)
+    wandb.log({"embeddings": wandb.Image(fig)})
+    # get intra-speaker distance
+    ## embeddings
+    speaker_to_embedding = {}
+    for speaker, embedding in zip(speakers, embeddings):
+        if speaker not in speaker_to_embedding:
+            speaker_to_embedding[speaker] = []
+        speaker_to_embedding[speaker].append(embedding)
+    intra_speaker_distances = []
+    for speaker, embeddings in speaker_to_embedding.items():
+        for i, embedding in enumerate(embeddings):
+            for j in range(i+1, len(embeddings)):
+                intra_speaker_distances.append(np.linalg.norm(embedding - embeddings[j]))
+    intra_speaker_distances = np.array(intra_speaker_distances)
+    intra_speaker_distance_mean = np.mean(intra_speaker_distances)
+    ## dvectors
+    speaker_to_dvector = {}
+    for speaker, dvector in zip(speakers, dvectors):
+        if speaker not in speaker_to_dvector:
+            speaker_to_dvector[speaker] = []
+        speaker_to_dvector[speaker].append(dvector)
+    intra_speaker_distances_dvector = []
+    for speaker, dvectors in speaker_to_dvector.items():
+        for i, dvector in enumerate(dvectors):
+            for j in range(i+1, len(dvectors)):
+                intra_speaker_distances_dvector.append(np.linalg.norm(dvector - dvectors[j]))
+    intra_speaker_distances_dvector = np.array(intra_speaker_distances_dvector)
+    intra_speaker_distance_mean_dvector = np.mean(intra_speaker_distances_dvector)
+    # plot
+    fig, ax = plt.subplots(figsize=(10, 10))
+    sns.histplot(intra_speaker_distances, ax=ax, label="embedding")
+    sns.histplot(intra_speaker_distances_dvector, ax=ax, label="dvector")
+    ax.legend()
+    wandb.log({"intra-speaker distance": wandb.Image(fig)})
+    # log
+    wandb.log({"intra-speaker distance embedding": intra_speaker_distance_mean, "step": step})
+    wandb.log({"intra-speaker distance dvector": intra_speaker_distance_mean_dvector, "step": step})
+    print(f"eval loss: {loss / i}")
+    print(f"intra-speaker distance embedding: {intra_speaker_distance_mean}")
+    print(f"intra-speaker distance dvector: {intra_speaker_distance_mean_dvector}")
+    # inter-speaker distance
+    inter_speaker_distances_dvec = []
+    for speaker, dvectors in speaker_to_dvector.items():
+        for speaker2, dvectors2 in speaker_to_dvector.items():
+            if speaker == speaker2:
+                continue
+            dvector_mean = np.array(dvectors).mean(axis=0)
+            dvector2_mean = np.array(dvectors2).mean(axis=0)
+            inter_speaker_distances_dvec.append(np.linalg.norm(dvector_mean - dvector2_mean))
+    inter_speaker_distances_dvec = np.array(inter_speaker_distances_dvec)
+    inter_speaker_distance_mean_dvec = np.mean(inter_speaker_distances_dvec)
+    ## embeddings   
+    inter_speaker_distances_emb = []
+    for speaker, embeddings in speaker_to_embedding.items():
+        for speaker2, embeddings2 in speaker_to_embedding.items():
+            if speaker == speaker2:
+                continue
+            # take mean of embedding and embedding2, then compute distance
+            embedding_mean = np.array(embeddings).mean(axis=0)
+            embedding2_mean = np.array(embeddings2).mean(axis=0)
+            inter_speaker_distances_emb.append(np.linalg.norm(embedding_mean - embedding2_mean))
+    inter_speaker_distances_emb = np.array(inter_speaker_distances_emb)
+    inter_speaker_distance_mean_emb = np.mean(inter_speaker_distances_emb)
+    # plot
+    fig, ax = plt.subplots(figsize=(10, 10))
+    sns.histplot(inter_speaker_distances_emb, ax=ax, label="embedding")
+    sns.histplot(inter_speaker_distances_dvec, ax=ax, label="dvector")
+    ax.legend()
+    wandb.log({"inter-speaker distance": wandb.Image(fig)})
+    # log
+    wandb.log({"inter-speaker distance embedding": inter_speaker_distance_mean_emb, "step": step})
+    wandb.log({"inter-speaker distance dvector": inter_speaker_distance_mean_dvec, "step": step})
+    print(f"inter-speaker distance embedding: {inter_speaker_distance_mean_emb}")
+    print(f"inter-speaker distance dvector: {inter_speaker_distance_mean_dvec}")
     loss /= i
     wandb.log({"eval_loss": loss, "step": step})
 
@@ -136,6 +233,7 @@ class MelCollator():
             "mel": torch.stack([row["mel"] for row in batch]),
             "mask": torch.stack([row["mask"] for row in batch]),
             "padding_mask": torch.stack([row["padding_mask"] for row in batch]),
+            "speaker": [row["speaker"] for row in batch],
         }
         return batch
 
@@ -199,6 +297,10 @@ def main():
         dropout=args.dropout,
         vocex=vocex_model,
         downsample_factor=args.downsample_factor,
+        do_bucketize=args.do_bucketize,
+        pitch_buckets=args.pitch_buckets,
+        energy_buckets=args.energy_buckets,
+        use_energy=args.use_energy,
     )
 
 
@@ -231,6 +333,7 @@ def main():
         num_workers=args.num_workers,
         collate_fn=collator.collate_fn,
         prefetch_factor=args.prefetch_factor,
+        shuffle=True,
     )
 
     eval_dataloader = torch.utils.data.DataLoader(
@@ -279,12 +382,12 @@ def main():
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_value_(model.parameters(), args.max_grad_norm)
                 if step % args.gradient_sync_every == 0:
-                    outputs = model(**batch)
+                    outputs = model(mel=batch["mel"], mask=batch["mask"], padding_mask=batch["padding_mask"])
                     loss = outputs["loss"] / args.gradient_accumulation_steps
                     accelerator.backward(loss)
                 else:
                     with accelerator.no_sync(model):
-                        outputs = model(**batch)
+                        outputs = model(mel=batch["mel"], mask=batch["mask"], padding_mask=batch["padding_mask"])
                         loss = outputs["loss"] / args.gradient_accumulation_steps
                         accelerator.backward(loss)
                 ## add to queues
